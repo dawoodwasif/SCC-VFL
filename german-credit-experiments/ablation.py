@@ -164,17 +164,147 @@ def compute_scg_fr(encoder, classifier, gen, X_eval, temp_scaler=None):
     fr = (y0 != y1).float().mean().item() * 100.0
     return scg, fr
 
-def graph_free_discovery(X_np, p_np, top_frac=0.33, eps=2.0, seed=42):
+def graph_free_discovery(
+    X_np,
+    p_np,
+    top_frac: float = 0.33,
+    eps: float = 2.0,
+    seed: int = 42,
+    cor_flag: bool = False,
+):
+    """
+    Graph-free mask discovery.
+
+    When cor_flag = False:
+        - Behaves like the original implementation: rank by mutual information
+          I(x_j; s) and take the top 'top_frac' as mediators (MMM), with a
+          small random flip probability.
+
+    When cor_flag = True:
+        - Still computes MI(x_j; s) for reporting / compatibility.
+        - Additionally computes DP-noisy HISC and ΔP per feature using
+          a simple Laplace mechanism.
+        - Uses a combined DP score (MI + HISC + ΔP) to rank features
+          and select MMM.
+    """
+    rng = np.random.RandomState(seed)
+
+    # ----------------------------------
+    # 1) Mutual information (non-DP)
+    # ----------------------------------
+    mi = mutual_info_classif(X_np, p_np, random_state=seed)
+
     n, d = X_np.shape
-    mi = mutual_info_classif(X_np, p_np, discrete_features=False, random_state=seed)
-    order = np.argsort(mi)[::-1]
     k = max(1, int(np.ceil(d * top_frac)))
+
+    if not cor_flag:
+        # Original behavior: MI ranking + one random DP-style flip
+        order = np.argsort(mi)[::-1]
+        MMM = set(order[:k])
+
+        # Very simple "DP-ish" flip as in the original code
+        flip_prob = min(1.0, 1.0 / (len(X_np) * eps))
+        if rng.rand() < flip_prob:
+            others = list(set(range(d)) - MMM)
+            if len(others) > 0:
+                MMM.add(int(rng.choice(others)))
+        return MMM, mi
+
+    # ============================================================
+    # cor_flag = True: DP HISC / ΔP-based refinement
+    # ============================================================
+
+    # Helper: binarize a feature for ΔP using median threshold
+    def _binarize_feature(x_col: np.ndarray) -> np.ndarray:
+        x = x_col.astype(float)
+        # Guard against degenerate / constant columns
+        if np.allclose(x.min(), x.max()):
+            return np.zeros_like(x, dtype=int)
+        med = np.median(x)
+        return (x > med).astype(int)
+
+    # Helper: DP ΔP = |P(x=1 | s=1) - P(x=1 | s=0)| with Laplace noise
+    def _dp_delta_p(x_bin: np.ndarray, s: np.ndarray, eps_local: float) -> float:
+        # Counts: n_{s,v} for s∈{0,1}, v∈{0,1}
+        counts = np.zeros((2, 2), dtype=float)
+        for ss in (0, 1):
+            mask_s = (s == ss)
+            for v in (0, 1):
+                counts[ss, v] = np.sum(mask_s & (x_bin == v))
+
+        # Add Laplace noise on counts (sensitivity 1)
+        scale = 1.0 / eps_local
+        noise = rng.laplace(loc=0.0, scale=scale, size=counts.shape)
+        noisy_counts = counts + noise
+        noisy_counts = np.clip(noisy_counts, 1e-6, None)
+
+        # P(x=1 | s)
+        probs = noisy_counts / noisy_counts.sum(axis=1, keepdims=True)
+        p1_s0 = probs[0, 1]
+        p1_s1 = probs[1, 1]
+        return float(abs(p1_s1 - p1_s0))
+
+    # Helper: DP HISC-like covariance magnitude between x (scaled to [0,1]) and s
+    def _dp_hisc(x_col: np.ndarray, s: np.ndarray, eps_local: float) -> float:
+        x = x_col.astype(float)
+        # Scale x to [0,1] to bound sensitivity
+        xmin, xmax = x.min(), x.max()
+        if np.allclose(xmin, xmax):
+            x_scaled = np.zeros_like(x)
+        else:
+            x_scaled = (x - xmin) / (xmax - xmin)
+
+        s_float = s.astype(float)
+        n_local = len(x_scaled)
+
+        # Sensitivity of each mean is at most 1/n over [0,1]
+        scale = 1.0 / (n_local * eps_local)
+
+        Ex = x_scaled.mean() + rng.laplace(0.0, scale)
+        Es = s_float.mean() + rng.laplace(0.0, scale)
+        Exs = (x_scaled * s_float).mean() + rng.laplace(0.0, scale)
+
+        cov_dp = Exs - Ex * Es
+        return float(abs(cov_dp))
+
+    # ----------------------------------
+    # 2) DP HISC and ΔP per feature
+    # ----------------------------------
+    delta_p_dp = np.zeros(d, dtype=float)
+    hisc_dp = np.zeros(d, dtype=float)
+
+    # Split budget crudely between HISC and ΔP
+    eps_hisc = eps / 2.0
+    eps_dp = eps / 2.0
+
+    for j in range(d):
+        x_j = X_np[:, j]
+        x_bin = _binarize_feature(x_j)
+
+        delta_p_dp[j] = _dp_delta_p(x_bin, p_np, eps_local=eps_dp)
+        hisc_dp[j] = _dp_hisc(x_j, p_np, eps_local=eps_hisc)
+
+    # ----------------------------------
+    # 3) Combined DP ranking score
+    # ----------------------------------
+    # Normalize components to comparable scales
+    mi_norm = (mi - mi.min()) / (mi.max() - mi.min() + 1e-8)
+    dp_norm = (delta_p_dp - delta_p_dp.min()) / (delta_p_dp.max() - delta_p_dp.min() + 1e-8)
+    hisc_norm = (hisc_dp - hisc_dp.min()) / (hisc_dp.max() - hisc_dp.min() + 1e-8)
+
+    # Combined score: higher means "stronger descendant / proxy signal"
+    # You can tune the weights if you like; 1:1:1 keeps it simple.
+    score = mi_norm + dp_norm + hisc_norm
+
+    order = np.argsort(score)[::-1]
     MMM = set(order[:k])
-    flip_prob = max(0.0, min(1.0, 1.0 / (n * max(eps, 1e-6))))
-    if np.random.rand() < flip_prob:
+
+    # Optional small DP-style random flip (as in original)
+    flip_prob = min(1.0, 1.0 / (len(X_np) * eps))
+    if rng.rand() < flip_prob:
         others = list(set(range(d)) - MMM)
         if len(others) > 0:
-            MMM.add(int(np.random.choice(others)))
+            MMM.add(int(rng.choice(others)))
     return MMM, mi
 
 # ================================================================
